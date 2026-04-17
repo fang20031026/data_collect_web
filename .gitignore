@@ -1,0 +1,24 @@
+# Python / local runtime
+__pycache__/
+*.py[cod]
+.codex
+
+# Build outputs
+build/
+dist/
+
+# Local recordings and temporary data
+recordings/
+*.webm
+*.mp4
+
+# Keep the Linux handoff archive, but do not track expanded release binaries.
+release/*
+!release/camera_collector_linux_x86_64.tar.gz
+
+# Optional third-party binaries can be large and platform-specific.
+third_party/ffmpeg/windows/ffmpeg.exe
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

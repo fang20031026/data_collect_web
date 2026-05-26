@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -387,6 +388,10 @@ CLIENT_CAMERA_HTML = """<!doctype html>
     let autoSave = true;
     let pendingRecording = null;
     let multiStopState = null;
+    let multiUploadSession = null;
+    let multiFrameTimer = null;
+    let multiFrameCount = 0;
+    const multiOutputFps = 30;
     let busy = false;
 
     function setStatus(message, kind = "") {
@@ -465,7 +470,7 @@ CLIENT_CAMERA_HTML = """<!doctype html>
       saveModeButton.textContent = autoSave ? "自动保存：开" : "自动保存：关";
       saveModeButton.classList.toggle("manual", !autoSave);
       saveModeButton.setAttribute("aria-pressed", autoSave ? "true" : "false");
-      saveModeButton.title = autoSave ? "停止录制后自动保存到目录" : "停止录制后手动点击保存";
+      saveModeButton.title = autoSave ? "Auto-save after stopping" : "Click save after stopping";
     }
 
     function triggerDownload() {
@@ -637,7 +642,7 @@ CLIENT_CAMERA_HTML = """<!doctype html>
       const video = {
         width: { ideal: 1920 },
         height: { ideal: 1080 },
-        frameRate: { ideal: 30 }
+        frameRate: { ideal: multiOutputFps, max: multiOutputFps }
       };
       if (cameraSelect.value) {
         video.deviceId = { exact: cameraSelect.value };
@@ -681,9 +686,9 @@ CLIENT_CAMERA_HTML = """<!doctype html>
         await refreshCameras();
         recordStartButton.disabled = !window.MediaRecorder;
         const track = currentStream.getVideoTracks()[0];
-        cameraStatusEl.textContent = track && track.label ? "当前：" + track.label : "当前摄像头已打开";
+        cameraStatusEl.textContent = track && track.label ? "Current: " + track.label : "Current camera opened";
         cameraStatusEl.className = "ok";
-        setStatus(window.MediaRecorder ? "摄像头已打开" : "摄像头已打开，当前浏览器不支持录制", window.MediaRecorder ? "ok" : "warn");
+        setStatus(window.MediaRecorder ? "Camera opened" : "Camera opened, but this browser cannot record", window.MediaRecorder ? "ok" : "warn");
       } catch (err) {
         setStatus(cameraErrorMessage(err), "bad");
         startButton.disabled = false;
@@ -823,25 +828,55 @@ CLIENT_CAMERA_HTML = """<!doctype html>
     function canvasStreamForRole(role) {
       const item = multi[role];
       if (!item.canvas.captureStream) {
-        throw new Error("当前浏览器不支持 canvas 录制");
+        throw new Error("Current browser does not support canvas recording");
       }
-      return item.canvas.captureStream(30);
+      return item.canvas.captureStream(0);
     }
 
-    function startMultiRecording() {
+    function drawAlignedMultiFrame() {
+      multiRoles.forEach(role => {
+        const item = multi[role];
+        const context = item.canvas.getContext("2d");
+        const target = multiConfig[role];
+        context.drawImage(item.video, 0, 0, target.width, target.height);
+        if (item.recordTrack && item.recordTrack.requestFrame) {
+          item.recordTrack.requestFrame();
+        }
+      });
+      multiFrameCount += 1;
+    }
+
+    function startAlignedMultiClock() {
+      stopAlignedMultiClock();
+      multiFrameCount = 0;
+      const frameInterval = 1000 / multiOutputFps;
+      let nextFrameAt = performance.now();
+
+      const tick = () => {
+        const now = performance.now();
+        while (nextFrameAt <= now + 1) {
+          drawAlignedMultiFrame();
+          nextFrameAt += frameInterval;
+        }
+        multiFrameTimer = window.setTimeout(tick, Math.max(0, nextFrameAt - performance.now()));
+      };
+      tick();
+    }
+
+    function stopAlignedMultiClock() {
+      if (multiFrameTimer) {
+        window.clearTimeout(multiFrameTimer);
+        multiFrameTimer = null;
+      }
+    }
+
+    async function startMultiRecording() {
       if (!multiReady() || !window.MediaRecorder) {
-        setStatus("请先打开 head、left、right 三路摄像头", "warn");
+        setStatus("Open head, left, and right cameras first", "warn");
         return;
       }
 
       pendingRecording = null;
-      multiStopState = {
-        count: 0,
-        blobs: {},
-        startedAt: new Date().toISOString(),
-        stoppedAt: "",
-        durationMs: 0
-      };
       savePendingButton.hidden = true;
       downloadLink.hidden = true;
       if (downloadLink.href) {
@@ -849,51 +884,7 @@ CLIENT_CAMERA_HTML = """<!doctype html>
         downloadLink.removeAttribute("href");
       }
 
-      const mimeType = pickMimeType();
-      const options = mimeType ? { mimeType } : {};
-      try {
-        multiRoles.forEach(role => {
-          const item = multi[role];
-          item.chunks = [];
-          const stream = canvasStreamForRole(role);
-          item.recorder = new MediaRecorder(stream, options);
-          item.startedAt = multiStopState.startedAt;
-          item.recorder.addEventListener("dataavailable", event => {
-            if (event.data && event.data.size > 0) {
-              item.chunks.push(event.data);
-            }
-          });
-          item.recorder.addEventListener("stop", () => {
-            const sourceType = item.recorder.mimeType || "video/webm";
-            multiStopState.blobs[role] = new Blob(item.chunks, { type: sourceType });
-            multiStopState.count += 1;
-            if (multiStopState.count === multiRoles.length) {
-              finishMultiRecording();
-            }
-          });
-        });
-        multiRoles.forEach(role => multi[role].recorder.start(1000));
-      } catch (err) {
-        console.error(err);
-        setStatus(err.message || "多摄像头录制启动失败", "bad");
-        return;
-      }
-
-      startRecordingTimer();
-      setBusy(true);
-      recordStartButton.disabled = true;
-      recordStopButton.disabled = false;
-      setStatus("正在录制三路摄像头", "ok");
-    }
-
-    function finishMultiRecording() {
-      stopRecordingTimer();
-      const stoppedAt = new Date().toISOString();
-      const recordedDuration = Date.now() - recordingStartedAt;
-      multiStopState.stoppedAt = stoppedAt;
-      multiStopState.durationMs = recordedDuration;
-      recordingTimeEl.textContent = "录制完成 " + formatDuration(recordedDuration);
-
+      const startedAt = new Date().toISOString();
       const streams = {};
       multiRoles.forEach(role => {
         const item = multi[role];
@@ -905,25 +896,139 @@ CLIENT_CAMERA_HTML = """<!doctype html>
         };
       });
 
-      pendingRecording = {
-        mode: "multi",
-        blobs: multiStopState.blobs,
+      multiStopState = {
+        count: 0,
+        startedAt,
+        stoppedAt: "",
+        durationMs: 0,
+        failed: false,
         metadata: {
           mode: "multi",
-          started_at: multiStopState.startedAt,
-          stopped_at: stoppedAt,
-          duration_ms: recordedDuration,
+          started_at: startedAt,
+          stopped_at: "",
+          duration_ms: 0,
+          fps: multiOutputFps,
+          frame_count: 0,
+          frame_interval_ms: 1000 / multiOutputFps,
           streams
         }
       };
+
+      setBusy(true);
+      recordStartButton.disabled = true;
+      recordStopButton.disabled = true;
+      setStatus("Creating multi-camera recording session...", "warn");
+
+      try {
+        multiUploadSession = await startMultiRecordingSession(multiStopState.metadata);
+      } catch (err) {
+        console.error(err);
+        multiStopState = null;
+        multiUploadSession = null;
+        setBusy(false);
+        updateMultiRecordButton();
+        setStatus("Failed to create recording session", "bad");
+        return;
+      }
+
+      const mimeType = pickMimeType();
+      const options = mimeType ? { mimeType } : {};
+      try {
+        multiRoles.forEach(role => {
+          const item = multi[role];
+          item.chunks = [];
+          item.uploadChain = Promise.resolve();
+          item.uploadError = null;
+          const stream = canvasStreamForRole(role);
+          item.recordTrack = stream.getVideoTracks()[0];
+          item.recorder = new MediaRecorder(stream, options);
+          item.startedAt = startedAt;
+          item.recorder.addEventListener("dataavailable", event => {
+            if (event.data && event.data.size > 0) {
+              item.uploadChain = item.uploadChain
+                .then(() => appendMultiRecordingChunk(multiUploadSession.session_id, role, event.data))
+                .catch(err => {
+                  item.uploadError = err;
+                  if (multiStopState) {
+                    multiStopState.failed = true;
+                  }
+                  console.error(err);
+                  setStatus("Recording chunk upload failed", "bad");
+                });
+            }
+          });
+          item.recorder.addEventListener("stop", async () => {
+            await item.uploadChain;
+            if (!multiStopState) {
+              return;
+            }
+            multiStopState.count += 1;
+            if (multiStopState.count === multiRoles.length) {
+              finishMultiRecording();
+            }
+          });
+        });
+        multiRoles.forEach(role => multi[role].recorder.start(1000));
+        startAlignedMultiClock();
+      } catch (err) {
+        console.error(err);
+        stopAlignedMultiClock();
+        if (multiUploadSession) {
+          abortMultiRecordingSession(multiUploadSession.session_id);
+        }
+        multiUploadSession = null;
+        multiStopState = null;
+        setBusy(false);
+        updateMultiRecordButton();
+        setStatus(err.message || "Failed to start multi-camera recording", "bad");
+        return;
+      }
+
+      startRecordingTimer();
+      recordStartButton.disabled = true;
+      recordStopButton.disabled = false;
+      setStatus("Recording three cameras", "ok");
+    }
+
+    function finishMultiRecording() {
+      stopAlignedMultiClock();
+      stopRecordingTimer();
+      if (!multiStopState) {
+        return;
+      }
+      const stoppedAt = new Date().toISOString();
+      const recordedDuration = Date.now() - recordingStartedAt;
+      multiStopState.stoppedAt = stoppedAt;
+      multiStopState.durationMs = recordedDuration;
+      multiStopState.metadata.stopped_at = stoppedAt;
+      multiStopState.metadata.duration_ms = recordedDuration;
+      multiStopState.metadata.frame_count = multiFrameCount;
+      recordingTimeEl.textContent = "Recorded " + formatDuration(recordedDuration);
+
+      pendingRecording = {
+        mode: "multi_session",
+        sessionId: multiUploadSession ? multiUploadSession.session_id : "",
+        metadata: multiStopState.metadata
+      };
+      const uploadFailed = multiStopState.failed || multiRoles.some(role => multi[role].uploadError);
       multiStopState = null;
+      multiUploadSession = null;
+
+      if (uploadFailed || !pendingRecording.sessionId) {
+        savePendingButton.hidden = false;
+        setBusy(false);
+        setStatus("Recording stopped, but chunk upload failed. Retry saving.", "bad");
+        updateMultiRecordButton();
+        recordStopButton.disabled = true;
+        return;
+      }
 
       if (autoSave) {
         savePendingRecording();
       } else {
         savePendingButton.hidden = false;
         setBusy(false);
-        setStatus("三路录制已停止，等待手动保存", "warn");
+        setStatus("Recording stopped. Waiting for manual save.", "warn");
         updateMultiRecordButton();
         recordStopButton.disabled = true;
       }
@@ -948,23 +1053,64 @@ CLIENT_CAMERA_HTML = """<!doctype html>
       return await response.json();
     }
 
-    async function saveMultiRecordingToServer(recording) {
-      const form = new FormData();
-      form.append("dir", saveDirInput.value.trim());
-      form.append("metadata", JSON.stringify(recording.metadata));
-      multiRoles.forEach(role => {
-        form.append(role, recording.blobs[role], role + ".webm");
-      });
-
-      const response = await fetch("/save-multi-recording", {
+    async function startMultiRecordingSession(metadata) {
+      const response = await fetch("/multi-recording/start", {
         method: "POST",
-        body: form
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dir: saveDirInput.value.trim(),
+          metadata
+        })
       });
       if (!response.ok) {
         const detail = await response.text();
-        throw new Error(detail || "Save failed");
+        throw new Error(detail || "Start session failed");
       }
       return await response.json();
+    }
+
+    async function appendMultiRecordingChunk(sessionId, role, blob) {
+      const response = await fetch(
+        "/multi-recording/append?session=" + encodeURIComponent(sessionId) +
+        "&role=" + encodeURIComponent(role),
+        {
+          method: "POST",
+          headers: { "Content-Type": blob.type || "application/octet-stream" },
+          body: blob
+        }
+      );
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(detail || "Append chunk failed");
+      }
+    }
+
+    async function finishMultiRecordingSession(recording) {
+      const response = await fetch("/multi-recording/finish", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: recording.sessionId,
+          metadata: recording.metadata
+        })
+      });
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(detail || "Finish session failed");
+      }
+      return await response.json();
+    }
+
+    async function abortMultiRecordingSession(sessionId) {
+      try {
+        await fetch("/multi-recording/abort", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId })
+        });
+      } catch (err) {
+        console.error(err);
+      }
     }
 
     async function savePendingRecording() {
@@ -979,8 +1125,8 @@ CLIENT_CAMERA_HTML = """<!doctype html>
 
       try {
         let result;
-        if (pendingRecording.mode === "multi") {
-          result = await saveMultiRecordingToServer(pendingRecording);
+        if (pendingRecording.mode === "multi_session") {
+          result = await finishMultiRecordingSession(pendingRecording);
           savePathEl.textContent = result.files.head;
           setStatus("已保存三路：" + result.index.toString().padStart(6, "0"), "ok");
         } else {
@@ -1020,6 +1166,7 @@ CLIENT_CAMERA_HTML = """<!doctype html>
 
     function stopRecording() {
       if (activeMode === "multi") {
+        stopAlignedMultiClock();
         multiRoles.forEach(role => {
           const recorder = multi[role].recorder;
           if (recorder && recorder.state !== "inactive") {
@@ -1078,11 +1225,11 @@ CLIENT_CAMERA_HTML = """<!doctype html>
       const messages = {
         NotAllowedError: "摄像头权限被拒绝，请在浏览器地址栏允许摄像头权限",
         NotFoundError: "未检测到摄像头，请检查 USB 连接",
-        NotReadableError: "摄像头可能被其他程序占用，请关闭其他摄像头软件",
+        NotReadableError: "Camera may be in use by another program",
         OverconstrainedError: "当前分辨率或帧率不支持，请换摄像头或降低要求",
         SecurityError: "浏览器安全策略阻止摄像头访问，请使用 localhost 页面"
       };
-      return messages[err.name] || ("打开失败：" + err.name + " - " + err.message);
+      return messages[err.name] || ("Open failed: " + err.name + " - " + err.message);
     }
 
     function checkBrowserCapabilities() {
@@ -1097,7 +1244,7 @@ CLIENT_CAMERA_HTML = """<!doctype html>
       }
 
       if (problems.length) {
-        browserStatusEl.textContent = problems.join("；") + "。请使用 Chrome、Edge 或 Firefox 最新版。";
+        browserStatusEl.textContent = problems.join("; ") + ". Please use the latest Chrome, Edge, or Firefox.";
         browserStatusEl.className = "bad";
         return;
       }
@@ -1115,13 +1262,13 @@ CLIENT_CAMERA_HTML = """<!doctype html>
         const health = await response.json();
         const parts = [
           "系统：" + health.platform,
-          "ffmpeg：" + (health.ffmpeg ? "可用" : "不可用"),
+          "ffmpeg: " + (health.ffmpeg ? "available" : "missing"),
           "目录选择：" + (health.directory_picker ? "可用" : "不可用")
         ];
         if (health.video_devices !== null) {
           parts.push("摄像头设备：" + health.video_devices);
         }
-        healthStatusEl.textContent = parts.join("，");
+        healthStatusEl.textContent = parts.join("; ");
         healthStatusEl.className = health.ffmpeg ? "ok" : "bad";
       } catch (err) {
         console.error(err);
@@ -1314,8 +1461,10 @@ def find_ffmpeg() -> str | None:
 
     executable = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
     candidates = [
+        os.path.join(app_base_dir(), "third_party", "ffmpeg", "windows", executable),
         os.path.join(app_base_dir(), "ffmpeg", executable),
         os.path.join(app_base_dir(), executable),
+        os.path.join(bundled_resource_dir(), "third_party", "ffmpeg", "windows", executable),
         os.path.join(bundled_resource_dir(), "ffmpeg", executable),
         os.path.join(bundled_resource_dir(), executable),
     ]
@@ -1367,6 +1516,55 @@ def convert_webm_to_mp4(data: bytes, output_size: tuple[int, int] | None = None)
 
         with open(output_path, "rb") as f:
             return f.read()
+
+
+def convert_webm_file_to_mp4_file(
+    input_path: str,
+    output_path: str,
+    output_size: tuple[int, int],
+    fps: int,
+    frame_count: int,
+) -> None:
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found")
+
+    width, height = output_size
+    filters = [
+        f"fps={fps}",
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+        "tpad=stop_mode=clone:stop_duration=3600",
+        f"trim=end_frame={frame_count}",
+        f"setpts=N/{fps}/TB",
+    ]
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        input_path,
+        "-an",
+        "-vf",
+        ",".join(filters),
+        "-frames:v",
+        str(frame_count),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode:
+        message = result.stderr.strip() or "ffmpeg failed"
+        raise RuntimeError(message)
 
 
 def pick_directory_with_native_dialog(initial_dir: str) -> str | None:
@@ -1504,6 +1702,9 @@ class CameraServer(ThreadingHTTPServer):
         self.args = args
         self.save_dir = resolve_save_dir(args.save_dir)
         self.save_lock = threading.Lock()
+        self.session_root = tempfile.mkdtemp(prefix="camera-sessions-")
+        self.sessions: dict[str, dict[str, object]] = {}
+        self.sessions_lock = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1548,6 +1749,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/save-multi-recording":
             self._save_multi_recording()
+            return
+        if parsed.path == "/multi-recording/start":
+            self._start_multi_recording_session()
+            return
+        if parsed.path == "/multi-recording/append":
+            query = parse_qs(parsed.query)
+            self._append_multi_recording_chunk(query)
+            return
+        if parsed.path == "/multi-recording/finish":
+            self._finish_multi_recording_session()
+            return
+        if parsed.path == "/multi-recording/abort":
+            self._abort_multi_recording_session()
             return
         if parsed.path == "/convert-to-mp4":
             self._convert_to_mp4()
@@ -1777,6 +1991,197 @@ class Handler(BaseHTTPRequestHandler):
         response_files["metadata"] = metadata_path
         self._send_json({"index": index, "files": response_files})
 
+    def _start_multi_recording_session(self) -> None:
+        data = self._read_request_body()
+        if data is None:
+            return
+
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except json.JSONDecodeError:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON")
+            return
+
+        requested_dir = str(payload.get("dir", "")).strip()
+        try:
+            save_dir = resolve_save_dir(requested_dir) if requested_dir else self.server.save_dir
+            for name in ("head", "left", "right", "metadata"):
+                os.makedirs(os.path.join(save_dir, name), exist_ok=True)
+        except OSError as exc:
+            self.send_error(HTTPStatus.BAD_REQUEST, f"Cannot create save directory: {exc}")
+            return
+
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        session_id = uuid.uuid4().hex
+        session_dir = os.path.join(self.server.session_root, session_id)
+        try:
+            os.makedirs(session_dir, exist_ok=False)
+        except OSError as exc:
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Cannot create session: {exc}")
+            return
+
+        paths = {role: os.path.join(session_dir, f"{role}.webm") for role in ("head", "left", "right")}
+        with self.server.sessions_lock:
+            self.server.sessions[session_id] = {
+                "dir": session_dir,
+                "save_dir": save_dir,
+                "metadata": metadata,
+                "paths": paths,
+                "lock": threading.Lock(),
+            }
+
+        self.server.save_dir = save_dir
+        self._send_json({"session_id": session_id})
+
+    def _append_multi_recording_chunk(self, query: dict[str, list[str]]) -> None:
+        session_id = query.get("session", [""])[0].strip()
+        role = query.get("role", [""])[0].strip()
+        if role not in ("head", "left", "right"):
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid role")
+            return
+
+        data = self._read_request_body()
+        if data is None:
+            return
+
+        with self.server.sessions_lock:
+            session = self.server.sessions.get(session_id)
+        if not session:
+            self.send_error(HTTPStatus.NOT_FOUND, "Recording session not found")
+            return
+
+        paths = session["paths"]
+        if not isinstance(paths, dict):
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Invalid session")
+            return
+        lock = session["lock"]
+
+        try:
+            with lock:
+                with open(str(paths[role]), "ab") as f:
+                    f.write(data)
+        except OSError as exc:
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Cannot append chunk: {exc}")
+            return
+
+        self._send_json({"ok": True})
+
+    def _finish_multi_recording_session(self) -> None:
+        data = self._read_request_body()
+        if data is None:
+            return
+
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except json.JSONDecodeError:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON")
+            return
+
+        session_id = str(payload.get("session_id", "")).strip()
+        with self.server.sessions_lock:
+            session = self.server.sessions.pop(session_id, None)
+        if not session:
+            self.send_error(HTTPStatus.NOT_FOUND, "Recording session not found")
+            return
+
+        try:
+            result = self._finalize_multi_session(session, payload.get("metadata"))
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._cleanup_session(session)
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Cannot save multi recording: {exc}")
+            return
+
+        self._cleanup_session(session)
+        self._send_json(result)
+
+    def _abort_multi_recording_session(self) -> None:
+        data = self._read_request_body()
+        if data is None:
+            return
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except json.JSONDecodeError:
+            payload = {}
+        session_id = str(payload.get("session_id", "")).strip()
+        with self.server.sessions_lock:
+            session = self.server.sessions.pop(session_id, None)
+        if session:
+            self._cleanup_session(session)
+        self._send_json({"ok": True})
+
+    def _finalize_multi_session(self, session: dict[str, object], metadata_payload: object) -> dict[str, object]:
+        metadata = metadata_payload if isinstance(metadata_payload, dict) else session.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        fps = int(metadata.get("fps") or 30)
+        frame_count = int(metadata.get("frame_count") or 0)
+        if fps <= 0 or frame_count <= 0:
+            raise ValueError("Invalid fps or frame_count")
+
+        save_dir = str(session["save_dir"])
+        paths = session["paths"]
+        if not isinstance(paths, dict):
+            raise ValueError("Invalid session paths")
+
+        role_sizes = {
+            "head": (1280, 720),
+            "left": (640, 360),
+            "right": (640, 360),
+        }
+        for role in ("head", "left", "right"):
+            if not os.path.exists(str(paths[role])) or os.path.getsize(str(paths[role])) <= 0:
+                raise ValueError(f"Missing recording: {role}")
+
+        with self.server.save_lock:
+            index = next_multi_recording_index(save_dir)
+            stem = f"{index:06d}"
+            output_paths = {
+                role: os.path.join(save_dir, role, f"{stem}.mp4")
+                for role in ("head", "left", "right")
+            }
+            metadata_path = os.path.join(save_dir, "metadata", f"{stem}.json")
+
+            for role, output_path in output_paths.items():
+                convert_webm_file_to_mp4_file(str(paths[role]), output_path, role_sizes[role], fps, frame_count)
+
+            metadata["mode"] = "multi"
+            metadata["index"] = index
+            metadata["fps"] = fps
+            metadata["frame_count"] = frame_count
+            metadata["duration_ms"] = round(frame_count * 1000 / fps)
+            streams = metadata.get("streams")
+            if not isinstance(streams, dict):
+                streams = {}
+            for role in ("head", "left", "right"):
+                role_stream = streams.get(role)
+                if not isinstance(role_stream, dict):
+                    role_stream = {}
+                role_stream["file"] = f"{role}/{stem}.mp4"
+                role_stream["width"] = role_sizes[role][0]
+                role_stream["height"] = role_sizes[role][1]
+                role_stream["fps"] = fps
+                role_stream["frame_count"] = frame_count
+                streams[role] = role_stream
+            metadata["streams"] = streams
+
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+
+        self.server.save_dir = save_dir
+        response_files = {role: path for role, path in output_paths.items()}
+        response_files["metadata"] = metadata_path
+        return {"index": index, "files": response_files}
+
+    def _cleanup_session(self, session: dict[str, object]) -> None:
+        session_dir = str(session.get("dir", ""))
+        if session_dir and os.path.isdir(session_dir):
+            shutil.rmtree(session_dir, ignore_errors=True)
+
     def _convert_to_mp4(self) -> None:
         if not find_ffmpeg():
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "ffmpeg not found")
@@ -1893,7 +2298,10 @@ def main() -> None:
     with CameraServer((args.host, args.port), Handler, args) as httpd:
         if not args.no_browser:
             threading.Timer(0.6, lambda: webbrowser.open(url)).start()
-        httpd.serve_forever()
+        try:
+            httpd.serve_forever()
+        finally:
+            shutil.rmtree(httpd.session_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

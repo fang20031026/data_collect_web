@@ -109,6 +109,19 @@ Windows 构建会生成：
 release\camera_collector_windows\camera_collector.exe
 ```
 
+
+Windows 发布包打包（在 Windows 机器执行）：
+
+```bat
+package_windows_release.bat
+```
+
+会生成：
+
+```text
+release\camera_collector_windows.zip
+```
+
 采集人员双击 `camera_collector.exe` 即可自动启动本地服务并打开浏览器。
 
 Windows 可执行文件需要在 Windows 机器上运行 `build_windows.bat` 构建。PyInstaller 不能在 Linux 上直接交叉生成 Windows `.exe`。

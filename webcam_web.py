@@ -953,7 +953,8 @@ CLIENT_CAMERA_HTML = """<!doctype html>
                     multiStopState.failed = true;
                   }
                   console.error(err);
-                  setStatus("Recording chunk upload failed", "bad");
+                  const detail = err && err.message ? (" - " + err.message) : "";
+                  setStatus("Recording chunk upload failed" + detail, "bad");
                 });
             }
           });
@@ -1702,7 +1703,6 @@ class CameraServer(ThreadingHTTPServer):
         self.args = args
         self.save_dir = resolve_save_dir(args.save_dir)
         self.save_lock = threading.Lock()
-        self.session_root = tempfile.mkdtemp(prefix="camera-sessions-")
         self.sessions: dict[str, dict[str, object]] = {}
         self.sessions_lock = threading.Lock()
 
@@ -2016,8 +2016,10 @@ class Handler(BaseHTTPRequestHandler):
             metadata = {}
 
         session_id = uuid.uuid4().hex
-        session_dir = os.path.join(self.server.session_root, session_id)
+        session_root = os.path.join(save_dir, "_camera_sessions")
+        session_dir = os.path.join(session_root, session_id)
         try:
+            os.makedirs(session_root, exist_ok=True)
             os.makedirs(session_dir, exist_ok=False)
         except OSError as exc:
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Cannot create session: {exc}")
@@ -2298,10 +2300,7 @@ def main() -> None:
     with CameraServer((args.host, args.port), Handler, args) as httpd:
         if not args.no_browser:
             threading.Timer(0.6, lambda: webbrowser.open(url)).start()
-        try:
-            httpd.serve_forever()
-        finally:
-            shutil.rmtree(httpd.session_root, ignore_errors=True)
+        httpd.serve_forever()
 
 
 if __name__ == "__main__":
